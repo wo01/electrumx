@@ -22,7 +22,7 @@ from functools import partial
 from aiorpcx import (
     RPCSession, JSONRPCAutoDetect, JSONRPCConnection,
     TaskGroup, handler_invocation, RPCError, Request, ignore_after, sleep,
-    Event
+    Event, NewlineFramer
 )
 
 import electrumx
@@ -604,7 +604,7 @@ class SessionBase(RPCSession):
 
     def __init__(self, session_mgr, db, mempool, peer_mgr, kind):
         connection = JSONRPCConnection(JSONRPCAutoDetect)
-        super().__init__(connection=connection)
+        super().__init__(connection=connection, framer=NewlineFramer(max_size=250*40000))
         self.logger = util.class_logger(__name__, self.__class__.__name__)
         self.session_mgr = session_mgr
         self.db = db
