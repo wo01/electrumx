@@ -366,9 +366,9 @@ class HOdlcoin(Coin):
     TX_PER_BLOCK = 5
 
 
-class BitcoinCash(BitcoinMixin, Coin):
-    NAME = "BitcoinCash"
-    SHORTNAME = "BCH"
+class BitcoinSV(BitcoinMixin, Coin):
+    NAME = "BitcoinSV"
+    SHORTNAME = "BSV"
     TX_COUNT = 267318795
     TX_COUNT_HEIGHT = 557037
     TX_PER_BLOCK = 400
@@ -380,8 +380,8 @@ class BitcoinCash(BitcoinMixin, Coin):
     ]
 
 
-class BitcoinCashABC(BitcoinMixin, Coin):
-    NAME = "BitcoinCashABC"
+class BitcoinCash(BitcoinMixin, Coin):
+    NAME = "BitcoinCashABC"   # Some releases later remove the ABC suffix
     SHORTNAME = "BCH"
     TX_COUNT = 265479628
     TX_COUNT_HEIGHT = 556592
@@ -494,6 +494,19 @@ class BitcoinGoldRegtest(BitcoinGold):
     PEERS = []
 
 
+class BitcoinDiamond(BitcoinSegwit, Coin):
+    NAME = "BitcoinDiamond"
+    SHORTNAME = "BCD"
+    TX_VERSION = 12
+    TX_COUNT = 274277819
+    TX_COUNT_HEIGHT = 498678
+    TX_PER_BLOCK = 50
+    REORG_LIMIT = 1000
+    PEERS = []
+    VALUE_PER_COIN = 10000000
+    DESERIALIZER = lib_tx.DeserializerBitcoinDiamondSegWit
+
+
 class Emercoin(Coin):
     NAME = "Emercoin"
     SHORTNAME = "EMC"
@@ -548,18 +561,15 @@ class BitcoinTestnetMixin(object):
     PEER_DEFAULT_PORTS = {'t': '51001', 's': '51002'}
 
 
-class BitcoinCashTestnet(BitcoinTestnetMixin, Coin):
-    '''Bitcoin Testnet for Bitcoin Cash daemons.'''
-    NAME = "BitcoinCash"
+class BitcoinSVTestnet(BitcoinTestnetMixin, Coin):
+    '''Bitcoin Testnet for Bitcoin SV daemons.'''
+    NAME = "BitcoinSV"
     PEERS = [
-        'electrum-testnet-abc.criptolayer.net s50112',
-        'bchtestnet.arihanc.com t53001 s53002',
-        'ciiattqkgzebpp6jofjbrkhvhwmgnsfoayljdcrve2p3qmkbv3duaoyd.onion '
-        't53001 s53002',
+        'electrontest.cascharia.com t51001 s51002',
     ]
 
 
-class BitcoinCashRegtest(BitcoinCashTestnet):
+class BitcoinSVRegtest(BitcoinSVTestnet):
     NET = "regtest"
     GENESIS_HASH = ('0f9188f13cb7b2c71f2a335e3a4fc328'
                     'bf5beb436012afca590b1a11466e2206')
@@ -666,8 +676,8 @@ class LitecoinRegtest(LitecoinTestnet):
     TX_COUNT_HEIGHT = 1
 
 
-class BitcoinCashABCRegtest(BitcoinTestnetMixin, Coin):
-    NAME = "BitcoinCashABC"
+class BitcoinCashRegtest(BitcoinTestnetMixin, Coin):
+    NAME = "BitcoinCashABC"   # Some releases later remove the ABC suffix
     NET = "regtest"
     PEERS = []
     GENESIS_HASH = ('0f9188f13cb7b2c71f2a335e3a4fc328'
@@ -1339,6 +1349,50 @@ class Peercoin(Coin):
     TX_PER_BLOCK = 4
     RPC_PORT = 9902
     REORG_LIMIT = 5000
+
+
+class Trezarcoin(Coin):
+    NAME = "Trezarcoin"
+    SHORTNAME = "TZC"
+    NET = "mainnet"
+    VALUE_PER_COIN = 1000000
+    XPUB_VERBYTES = bytes.fromhex("0488B21E")
+    XPRV_VERBYTES = bytes.fromhex("0488ADE4")
+    P2PKH_VERBYTE = bytes.fromhex("42")
+    P2SH_VERBYTES = [bytes.fromhex("08")]
+    WIF_BYTE = bytes.fromhex("c2")
+    GENESIS_HASH = ('24502ba55d673d2ee9170d83dae2d1ad'
+                    'b3bfb4718e4f200db9951382cc4f6ee6')
+    DESERIALIZER = lib_tx.DeserializerTrezarcoin
+    HEADER_HASH = lib_tx.DeserializerTrezarcoin.blake2s
+    HEADER_HASH_GEN = lib_tx.DeserializerTrezarcoin.blake2s_gen
+    BASIC_HEADER_SIZE = 80
+    TX_COUNT = 742886
+    TX_COUNT_HEIGHT = 643128
+    TX_PER_BLOCK = 2
+    RPC_PORT = 17299
+    REORG_LIMIT = 2000
+    PEERS = [
+        'electrumx1.trezarcoin.com s t',
+    ]
+
+    @classmethod
+    def genesis_block(cls, block):
+        '''Check the Genesis block is the right one for this coin.
+
+        Return the block less its unspendable coinbase.
+        '''
+        header = cls.block_header(block, 0)
+        header_hex_hash = cls.HEADER_HASH_GEN(header)
+        if header_hex_hash != cls.GENESIS_HASH:
+            raise CoinError('genesis block has hash {} expected {}'
+                            .format(header_hex_hash, cls.GENESIS_HASH))
+        return header + bytes(1)
+
+    @classmethod
+    def header_hash(cls, header):
+        '''Given a header return the hash.'''
+        return cls.HEADER_HASH(header)
 
 
 class Reddcoin(Coin):
