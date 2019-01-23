@@ -335,19 +335,14 @@ class SessionManager(object):
                            ])
         return result
 
-    async def _electrum_and_raw_headers(self, height):
-        raw_header = await self.raw_header(height)
-        electrum_header = self.env.coin.electrum_header(raw_header, height)
-        return electrum_header, raw_header
-
     async def _refresh_hsub_results(self, height):
         '''Refresh the cached header subscription responses to be for height,
         and record that as notified_height.
         '''
         # Paranoia: a reorg could race and leave db_height lower
         height = min(height, self.db.db_height)
-        electrum, raw = await self._electrum_and_raw_headers(height)
-        self.hsub_results = (electrum, {'hex': raw.hex(), 'height': height})
+        raw = await self.raw_header(height)
+        self.hsub_results = {'hex': raw.hex(), 'height': height}
         self.notified_height = height
 
     # --- LocalRPC command handlers
@@ -535,11 +530,6 @@ class SessionManager(object):
             raise RPCError(BAD_REQUEST, f'height {height:,d} '
                            'out of range') from None
 
-    async def electrum_header(self, height):
-        '''Return the deserialized header at the given height.'''
-        electrum_header, _ = await self._electrum_and_raw_headers(height)
-        return electrum_header
-
     async def broadcast_transaction(self, raw_tx):
         hex_hash = await self.daemon.broadcast_transaction(raw_tx)
         self.txs_sent += 1
@@ -701,13 +691,12 @@ class SessionBase(RPCSession):
 class ElectrumX(SessionBase):
     '''A TCP server that handles incoming Electrum connections.'''
 
-    PROTOCOL_MIN = (1, 2)
+    PROTOCOL_MIN = (1, 4)
     PROTOCOL_MAX = (1, 4)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.subscribe_headers = False
-        self.subscribe_headers_raw = False
         self.connection.max_response_size = self.env.max_send
         self.max_subs = self.env.max_session_subs
         self.hashX_subs = {}
@@ -790,25 +779,12 @@ class ElectrumX(SessionBase):
 
     async def subscribe_headers_result(self):
         '''The result of a header subscription or notification.'''
-        return self.session_mgr.hsub_results[self.subscribe_headers_raw]
-
-    async def _headers_subscribe(self, raw):
-        '''Subscribe to get headers of new blocks.'''
-        self.subscribe_headers_raw = assert_boolean(raw)
-        self.subscribe_headers = True
-        return await self.subscribe_headers_result()
+        return self.session_mgr.hsub_results
 
     async def headers_subscribe(self):
         '''Subscribe to get raw headers of new blocks.'''
-        return await self._headers_subscribe(True)
-
-    async def headers_subscribe_True(self, raw=True):
-        '''Subscribe to get headers of new blocks.'''
-        return await self._headers_subscribe(raw)
-
-    async def headers_subscribe_False(self, raw=False):
-        '''Subscribe to get headers of new blocks.'''
-        return await self._headers_subscribe(raw)
+        self.subscribe_headers = True
+        return await self.subscribe_headers_result()
 
     async def add_peer(self, features):
         '''Add a peer (but only if the peer resolves to the source).'''
@@ -870,40 +846,6 @@ class ElectrumX(SessionBase):
         self.session_mgr.new_subscription()
         self.hashX_subs[hashX] = alias
         return await self.address_status(hashX)
-
-    def address_to_hashX(self, address):
-        try:
-            return self.coin.address_to_hashX(address)
-        except Exception:
-            pass
-        raise RPCError(BAD_REQUEST, f'{address} is not a valid address')
-
-    async def address_get_balance(self, address):
-        '''Return the confirmed and unconfirmed balance of an address.'''
-        hashX = self.address_to_hashX(address)
-        return await self.get_balance(hashX)
-
-    async def address_get_history(self, address):
-        '''Return the confirmed and unconfirmed history of an address.'''
-        hashX = self.address_to_hashX(address)
-        return await self.confirmed_and_unconfirmed_history(hashX)
-
-    async def address_get_mempool(self, address):
-        '''Return the mempool transactions touching an address.'''
-        hashX = self.address_to_hashX(address)
-        return await self.unconfirmed_history(hashX)
-
-    async def address_listunspent(self, address):
-        '''Return the list of UTXOs of an address.'''
-        hashX = self.address_to_hashX(address)
-        return await self.hashX_listunspent(hashX)
-
-    async def address_subscribe(self, address):
-        '''Subscribe to an address.
-
-        address: the address to subscribe to'''
-        hashX = self.address_to_hashX(address)
-        return await self.hashX_subscribe(hashX, address)
 
     async def get_balance(self, hashX):
         utxos = await self.db.all_utxos(hashX)
@@ -979,12 +921,6 @@ class ElectrumX(SessionBase):
         result.update(await self._merkle_proof(cp_height, height))
         return result
 
-    async def block_header_13(self, height):
-        '''Return a raw block header as a hexadecimal string.
-
-        height: the header's height'''
-        return await self.block_header(height)
-
     async def block_headers(self, start_height, count, cp_height=0):
         '''Return count concatenated block headers as hex for the main chain;
         starting at start_height.
@@ -1004,26 +940,6 @@ class ElectrumX(SessionBase):
             last_height = start_height + count - 1
             result.update(await self._merkle_proof(cp_height, last_height))
         return result
-
-    async def block_headers_12(self, start_height, count):
-        return await self.block_headers(start_height, count)
-
-    async def block_get_chunk(self, index):
-        '''Return a chunk of block headers as a hexadecimal string.
-
-        index: the chunk index'''
-        index = non_negative_integer(index)
-        size = self.coin.CHUNK_SIZE
-        start_height = index * size
-        headers, _ = await self.db.read_headers(start_height, size)
-        return headers.hex()
-
-    async def block_get_header(self, height):
-        '''The deserialized header at a given height.
-
-        height: the header's height'''
-        height = non_negative_integer(height)
-        return await self.session_mgr.electrum_header(height)
 
     def is_tor(self):
         '''Try to detect if the connection is to a tor hidden service we are
@@ -1233,10 +1149,10 @@ class ElectrumX(SessionBase):
         self.protocol_tuple = ptuple
 
         handlers = {
-            'blockchain.block.get_chunk': self.block_get_chunk,
-            'blockchain.block.get_header': self.block_get_header,
-            'blockchain.block.headers': self.block_headers_12,
+            'blockchain.block.header': self.block_header,
+            'blockchain.block.headers': self.block_headers,
             'blockchain.estimatefee': self.estimatefee,
+            'blockchain.headers.subscribe': self.headers_subscribe,
             'blockchain.relayfee': self.relayfee,
             'blockchain.scripthash.get_balance': self.scripthash_get_balance,
             'blockchain.scripthash.get_history': self.scripthash_get_history,
@@ -1246,6 +1162,7 @@ class ElectrumX(SessionBase):
             'blockchain.transaction.broadcast': self.transaction_broadcast,
             'blockchain.transaction.get': self.transaction_get,
             'blockchain.transaction.get_merkle': self.transaction_merkle,
+            'blockchain.transaction.id_from_pos': self.transaction_id_from_pos,
             'mempool.get_fee_histogram': self.mempool.compact_fee_histogram,
             'server.add_peer': self.add_peer,
             'server.banner': self.banner,
@@ -1255,29 +1172,6 @@ class ElectrumX(SessionBase):
             'server.ping': self.ping,
             'server.version': self.server_version,
         }
-
-        if ptuple >= (1, 4):
-            handlers.update({
-                'blockchain.block.header': self.block_header,
-                'blockchain.block.headers': self.block_headers,
-                'blockchain.headers.subscribe': self.headers_subscribe,
-                'blockchain.transaction.id_from_pos':
-                    self.transaction_id_from_pos,
-            })
-        elif ptuple >= (1, 3):
-            handlers.update({
-                'blockchain.block.header': self.block_header_13,
-                'blockchain.headers.subscribe': self.headers_subscribe_True,
-            })
-        else:
-            handlers.update({
-                'blockchain.headers.subscribe': self.headers_subscribe_False,
-                'blockchain.address.get_balance': self.address_get_balance,
-                'blockchain.address.get_history': self.address_get_history,
-                'blockchain.address.get_mempool': self.address_get_mempool,
-                'blockchain.address.listunspent': self.address_listunspent,
-                'blockchain.address.subscribe': self.address_subscribe,
-            })
 
         self.request_handlers = handlers
 
@@ -1307,7 +1201,9 @@ class DashElectrumX(ElectrumX):
             'masternode.announce.broadcast':
             self.masternode_announce_broadcast,
             'masternode.subscribe': self.masternode_subscribe,
-            'masternode.list': self.masternode_list
+            'masternode.list': self.masternode_list,
+            'protx.diff': self.protx_diff,
+            'protx.info': self.protx_info,
         })
 
     async def notify(self, touched, height_changed):
@@ -1439,6 +1335,42 @@ class DashElectrumX(ElectrumX):
             return [mn for mn in cache if mn['payee'] in payees]
         else:
             return cache
+
+    async def protx_diff(self, base_height, height):
+        '''
+        Calculates a diff between two deterministic masternode lists.
+        The result also contains proof data.
+
+        base_height: The starting block height (starting from 1).
+        height: The ending block height.
+        '''
+        if not isinstance(base_height, int) or not isinstance(height, int):
+            raise RPCError(BAD_REQUEST, 'expected a int block heights')
+
+        max_height = self.db.db_height
+        if (not 1 <= base_height <= max_height or
+                not base_height <= height <= max_height):
+            raise RPCError(BAD_REQUEST,
+                           f'require 1 <= base_height {base_height:,d} <= '
+                           f'height {height:,d} <= '
+                           f'chain height {max_height:,d}')
+
+        return await self.daemon_request('protx',
+                                         ('diff', base_height, height))
+
+    async def protx_info(self, protx_hash):
+        '''
+        Returns detailed information about a deterministic masternode.
+
+        protx_hash: The hash of the initial ProRegTx
+        '''
+        if not isinstance(protx_hash, str):
+            raise RPCError(BAD_REQUEST, 'expected protx hash string')
+
+        res = await self.daemon_request('protx', ('info', protx_hash))
+        if 'wallet' in res:
+            del res['wallet']
+        return res
 
 
 class SmartCashElectrumX(DashElectrumX):
