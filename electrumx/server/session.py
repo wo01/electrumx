@@ -56,7 +56,7 @@ def non_negative_integer(value):
         value = int(value)
         if value >= 0:
             return value
-    except ValueError:
+    except (ValueError, TypeError):
         pass
     raise RPCError(BAD_REQUEST,
                    f'{value} should be a non-negative integer')
@@ -335,14 +335,19 @@ class SessionManager(object):
                            ])
         return result
 
+    async def _electrum_and_raw_headers(self, height):
+        raw_header = await self.raw_header(height)
+        electrum_header = self.env.coin.electrum_header(raw_header, height)
+        return electrum_header, raw_header
+
     async def _refresh_hsub_results(self, height):
         '''Refresh the cached header subscription responses to be for height,
         and record that as notified_height.
         '''
         # Paranoia: a reorg could race and leave db_height lower
         height = min(height, self.db.db_height)
-        raw = await self.raw_header(height)
-        self.hsub_results = {'hex': raw.hex(), 'height': height}
+        electrum, raw = await self._electrum_and_raw_headers(height)
+        self.hsub_results = (electrum, {'hex': raw.hex(), 'height': height})
         self.notified_height = height
 
     # --- LocalRPC command handlers
@@ -530,6 +535,11 @@ class SessionManager(object):
             raise RPCError(BAD_REQUEST, f'height {height:,d} '
                            'out of range') from None
 
+    async def electrum_header(self, height):
+        '''Return the deserialized header at the given height.'''
+        electrum_header, _ = await self._electrum_and_raw_headers(height)
+        return electrum_header
+
     async def broadcast_transaction(self, raw_tx):
         hex_hash = await self.daemon.broadcast_transaction(raw_tx)
         self.txs_sent += 1
@@ -691,12 +701,13 @@ class SessionBase(RPCSession):
 class ElectrumX(SessionBase):
     '''A TCP server that handles incoming Electrum connections.'''
 
-    PROTOCOL_MIN = (1, 4)
-    PROTOCOL_MAX = (1, 4)
+    PROTOCOL_MIN = (1, 2)
+    PROTOCOL_MAX = (1, 4, 1)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.subscribe_headers = False
+        self.subscribe_headers_raw = False
         self.connection.max_response_size = self.env.max_send
         self.max_subs = self.env.max_session_subs
         self.hashX_subs = {}
@@ -779,12 +790,25 @@ class ElectrumX(SessionBase):
 
     async def subscribe_headers_result(self):
         '''The result of a header subscription or notification.'''
-        return self.session_mgr.hsub_results
+        return self.session_mgr.hsub_results[self.subscribe_headers_raw]
+
+    async def _headers_subscribe(self, raw):
+        '''Subscribe to get headers of new blocks.'''
+        self.subscribe_headers_raw = assert_boolean(raw)
+        self.subscribe_headers = True
+        return await self.subscribe_headers_result()
 
     async def headers_subscribe(self):
         '''Subscribe to get raw headers of new blocks.'''
-        self.subscribe_headers = True
-        return await self.subscribe_headers_result()
+        return await self._headers_subscribe(True)
+
+    async def headers_subscribe_True(self, raw=True):
+        '''Subscribe to get headers of new blocks.'''
+        return await self._headers_subscribe(raw)
+
+    async def headers_subscribe_False(self, raw=False):
+        '''Subscribe to get headers of new blocks.'''
+        return await self._headers_subscribe(raw)
 
     async def add_peer(self, features):
         '''Add a peer (but only if the peer resolves to the source).'''
@@ -846,6 +870,40 @@ class ElectrumX(SessionBase):
         self.session_mgr.new_subscription()
         self.hashX_subs[hashX] = alias
         return await self.address_status(hashX)
+
+    def address_to_hashX(self, address):
+        try:
+            return self.coin.address_to_hashX(address)
+        except Exception:
+            pass
+        raise RPCError(BAD_REQUEST, f'{address} is not a valid address')
+
+    async def address_get_balance(self, address):
+        '''Return the confirmed and unconfirmed balance of an address.'''
+        hashX = self.address_to_hashX(address)
+        return await self.get_balance(hashX)
+
+    async def address_get_history(self, address):
+        '''Return the confirmed and unconfirmed history of an address.'''
+        hashX = self.address_to_hashX(address)
+        return await self.confirmed_and_unconfirmed_history(hashX)
+
+    async def address_get_mempool(self, address):
+        '''Return the mempool transactions touching an address.'''
+        hashX = self.address_to_hashX(address)
+        return await self.unconfirmed_history(hashX)
+
+    async def address_listunspent(self, address):
+        '''Return the list of UTXOs of an address.'''
+        hashX = self.address_to_hashX(address)
+        return await self.hashX_listunspent(hashX)
+
+    async def address_subscribe(self, address):
+        '''Subscribe to an address.
+
+        address: the address to subscribe to'''
+        hashX = self.address_to_hashX(address)
+        return await self.hashX_subscribe(hashX, address)
 
     async def get_balance(self, hashX):
         utxos = await self.db.all_utxos(hashX)
@@ -921,6 +979,12 @@ class ElectrumX(SessionBase):
         result.update(await self._merkle_proof(cp_height, height))
         return result
 
+    async def block_header_13(self, height):
+        '''Return a raw block header as a hexadecimal string.
+
+        height: the header's height'''
+        return await self.block_header(height)
+
     async def block_headers(self, start_height, count, cp_height=0):
         '''Return count concatenated block headers as hex for the main chain;
         starting at start_height.
@@ -940,6 +1004,26 @@ class ElectrumX(SessionBase):
             last_height = start_height + count - 1
             result.update(await self._merkle_proof(cp_height, last_height))
         return result
+
+    async def block_headers_12(self, start_height, count):
+        return await self.block_headers(start_height, count)
+
+    async def block_get_chunk(self, index):
+        '''Return a chunk of block headers as a hexadecimal string.
+
+        index: the chunk index'''
+        index = non_negative_integer(index)
+        size = self.coin.CHUNK_SIZE
+        start_height = index * size
+        headers, _ = await self.db.read_headers(start_height, size)
+        return headers.hex()
+
+    async def block_get_header(self, height):
+        '''The deserialized header at a given height.
+
+        height: the header's height'''
+        height = non_negative_integer(height)
+        return await self.session_mgr.electrum_header(height)
 
     def is_tor(self):
         '''Try to detect if the connection is to a tor hidden service we are
@@ -1052,15 +1136,24 @@ class ElectrumX(SessionBase):
         # This returns errors as JSON RPC errors, as is natural
         try:
             hex_hash = await self.session_mgr.broadcast_transaction(raw_tx)
-            self.txs_sent += 1
-            self.logger.info(f'sent tx: {hex_hash}')
-            return hex_hash
         except DaemonError as e:
             error, = e.args
             message = error['message']
             self.logger.info(f'error sending transaction: {message}')
             raise RPCError(BAD_REQUEST, 'the transaction was rejected by '
                            f'network rules.\n\n{message}\n[{raw_tx}]')
+        else:
+            self.txs_sent += 1
+            client_ver = util.protocol_tuple(self.client)
+            if client_ver != (0, ):
+                msg = self.coin.upgrade_required(client_ver)
+                if msg:
+                    self.logger.info(f'sent tx: {hex_hash}. and warned user to upgrade their '
+                                     f'client from {self.client}')
+                    return msg
+
+            self.logger.info(f'sent tx: {hex_hash}')
+            return hex_hash
 
     async def transaction_get(self, tx_hash, verbose=False):
         '''Return the serialized raw transaction given its hash
@@ -1111,6 +1204,7 @@ class ElectrumX(SessionBase):
         height: the height of the block it is in
         '''
         assert_tx_hash(tx_hash)
+        height = non_negative_integer(height)
         block_hash, tx_hashes = await self._block_hash_and_tx_hashes(height)
         try:
             pos = tx_hashes.index(tx_hash)
@@ -1129,6 +1223,7 @@ class ElectrumX(SessionBase):
         a block height and position in the block.
         '''
         tx_pos = non_negative_integer(tx_pos)
+        height = non_negative_integer(height)
         if merkle not in (True, False):
             raise RPCError(BAD_REQUEST, f'"merkle" must be a boolean')
 
@@ -1149,10 +1244,10 @@ class ElectrumX(SessionBase):
         self.protocol_tuple = ptuple
 
         handlers = {
-            'blockchain.block.header': self.block_header,
-            'blockchain.block.headers': self.block_headers,
+            'blockchain.block.get_chunk': self.block_get_chunk,
+            'blockchain.block.get_header': self.block_get_header,
+            'blockchain.block.headers': self.block_headers_12,
             'blockchain.estimatefee': self.estimatefee,
-            'blockchain.headers.subscribe': self.headers_subscribe,
             'blockchain.relayfee': self.relayfee,
             'blockchain.scripthash.get_balance': self.scripthash_get_balance,
             'blockchain.scripthash.get_history': self.scripthash_get_history,
@@ -1162,7 +1257,6 @@ class ElectrumX(SessionBase):
             'blockchain.transaction.broadcast': self.transaction_broadcast,
             'blockchain.transaction.get': self.transaction_get,
             'blockchain.transaction.get_merkle': self.transaction_merkle,
-            'blockchain.transaction.id_from_pos': self.transaction_id_from_pos,
             'mempool.get_fee_histogram': self.mempool.compact_fee_histogram,
             'server.add_peer': self.add_peer,
             'server.banner': self.banner,
@@ -1173,6 +1267,29 @@ class ElectrumX(SessionBase):
             'server.version': self.server_version,
         }
 
+        if ptuple >= (1, 4):
+            handlers.update({
+                'blockchain.block.header': self.block_header,
+                'blockchain.block.headers': self.block_headers,
+                'blockchain.headers.subscribe': self.headers_subscribe,
+                'blockchain.transaction.id_from_pos':
+                    self.transaction_id_from_pos,
+            })
+        elif ptuple >= (1, 3):
+            handlers.update({
+                'blockchain.block.header': self.block_header_13,
+                'blockchain.headers.subscribe': self.headers_subscribe_True,
+            })
+        else:
+            handlers.update({
+                'blockchain.headers.subscribe': self.headers_subscribe_False,
+                'blockchain.address.get_balance': self.address_get_balance,
+                'blockchain.address.get_history': self.address_get_history,
+                'blockchain.address.get_mempool': self.address_get_mempool,
+                'blockchain.address.listunspent': self.address_listunspent,
+                'blockchain.address.subscribe': self.address_subscribe,
+            })
+
         self.request_handlers = handlers
 
 
@@ -1182,7 +1299,7 @@ class LocalRPC(SessionBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.client = 'RPC'
-        self.connection._max_response_size = 0
+        self.connection.max_response_size = 0
 
     def protocol_version_string(self):
         return 'RPC'
@@ -1400,3 +1517,48 @@ class SmartCashElectrumX(DashElectrumX):
         if result is not None:
             return result
         return None
+
+
+class AuxPoWElectrumX(ElectrumX):
+    async def block_header(self, height, cp_height=0):
+        result = await super().block_header(height, cp_height)
+
+        # Older protocol versions don't truncate AuxPoW
+        if self.protocol_tuple < (1, 4, 1):
+            return result
+
+        # Not covered by a checkpoint; return full AuxPoW data
+        if cp_height == 0:
+            return result
+
+        # Covered by a checkpoint; truncate AuxPoW data
+        result['header'] = self.truncate_auxpow(result['header'], height)
+        return result
+
+    async def block_headers(self, start_height, count, cp_height=0):
+        result = await super().block_headers(start_height, count, cp_height)
+
+        # Older protocol versions don't truncate AuxPoW
+        if self.protocol_tuple < (1, 4, 1):
+            return result
+
+        # Not covered by a checkpoint; return full AuxPoW data
+        if cp_height == 0:
+            return result
+
+        # Covered by a checkpoint; truncate AuxPoW data
+        result['hex'] = self.truncate_auxpow(result['hex'], start_height)
+        return result
+
+    def truncate_auxpow(self, headers_full_hex, start_height):
+        height = start_height
+        headers_full = util.hex_to_bytes(headers_full_hex)
+        cursor = 0
+        headers = bytearray()
+
+        while cursor < len(headers_full):
+            headers.extend(headers_full[cursor:cursor+self.coin.BASIC_HEADER_SIZE])
+            cursor += self.db.dynamic_header_len(height)
+            height += 1
+
+        return headers.hex()
