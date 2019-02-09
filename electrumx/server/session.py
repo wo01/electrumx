@@ -262,9 +262,8 @@ class SessionManager(object):
                                  for session in stale_sessions)
                 self.logger.info(f'closing stale connections {text}')
                 # Give the sockets some time to close gracefully
-                async with TaskGroup() as group:
-                    for session in stale_sessions:
-                        await group.spawn(session.close())
+                for session in stale_sessions:
+                    await session.spawn(session.close())
 
             # Consolidate small groups
             bw_limit = self.env.bandwidth_limit
@@ -510,11 +509,12 @@ class SessionManager(object):
                 await group.spawn(self._log_sessions())
                 await group.spawn(self._manage_servers())
         finally:
-            # Close servers and sessions
+            # Close servers then sessions
             await self._close_servers(list(self.servers.keys()))
-            async with TaskGroup() as group:
-                for session in self.sessions:
-                    await group.spawn(session.close(force_after=1))
+            for session in list(self.sessions):
+                await session.spawn(session.close(force_after=1))
+            for session in list(self.sessions):
+                await session.closed_event.wait()
 
     def session_count(self):
         '''The number of connections that we've sent something to.'''
@@ -714,6 +714,7 @@ class ElectrumX(SessionBase):
         self.sv_seen = False
         self.mempool_statuses = {}
         self.set_request_handlers(self.PROTOCOL_MIN)
+        self.is_peer = False
 
     @classmethod
     def protocol_min_max_strings(cls):
@@ -812,11 +813,12 @@ class ElectrumX(SessionBase):
 
     async def add_peer(self, features):
         '''Add a peer (but only if the peer resolves to the source).'''
+        self.is_peer = True
         return await self.peer_mgr.on_add_peer(features, self.peer_address())
 
     async def peers_subscribe(self):
         '''Return the server peers as a list of (ip, host, details) tuples.'''
-        return self.peer_mgr.on_peers_subscribe(self.is_tor())
+        return self.peer_mgr.on_peers_subscribe(self.is_tor(), self.is_peer)
 
     async def address_status(self, hashX):
         '''Returns an address status.

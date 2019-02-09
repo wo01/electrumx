@@ -12,6 +12,8 @@ import random
 import socket
 import ssl
 import time
+import json
+import aiohttp
 from collections import defaultdict, Counter
 
 from aiorpcx import (Connector, RPCSession, SOCKSProxy,
@@ -75,6 +77,8 @@ class PeerManager(object):
         self.permit_onion_peer_time = time.time()
         self.proxy = None
         self.group = TaskGroup()
+        # refreshed
+        self.blacklist = set()
 
     def _my_clearnet_peer(self):
         '''Returns the clearnet peer representing this server, if any.'''
@@ -129,6 +133,21 @@ class PeerManager(object):
                                   for real_name in self.env.coin.PEERS)
         await self._note_peers(imported_peers, limit=None)
 
+    async def _refresh_blacklist(self):
+        url = self.env.blacklist_url
+        if not url:
+            return
+        while True:
+            session = aiohttp.ClientSession()
+            try:
+                async with session.get(url) as response:
+                    r = await response.text()
+                self.blacklist = set(json.loads(r))
+                self.logger.info(f'blacklist from {url} has {len(self.blacklist)} entries')
+            except Exception as e:
+                self.logger.error(f'could not retrieve blacklist from {url}: {e}')
+            await sleep(600)
+
     async def _detect_proxy(self):
         '''Detect a proxy if we don't have one and some time has passed since
         the last attempt.
@@ -152,28 +171,24 @@ class PeerManager(object):
             self.logger.info('no proxy detected, will try later')
             await sleep(900)
 
-    async def _note_peers(self, peers, limit=2, check_ports=False, check_matches=False,
-                          source=None):
+    async def _note_peers(self, peers, limit=2, check_ports=False, source=None):
         '''Add a limited number of peers that are not already present.'''
         new_peers = []
-        known = []
+        match_set = self.peers.copy()
         for peer in peers:
             if not peer.is_public or (peer.is_tor and not self.proxy):
                 continue
 
-            matches = peer.matches(self.peers)
+            matches = peer.matches(match_set)
             if matches:
-                known.append(peer)
                 if check_ports:
                     for match in matches:
                         if match.check_ports(peer):
                             self.logger.info(f'ports changed for {peer}')
                             match.retry_event.set()
             else:
+                match_set.add(peer)
                 new_peers.append(peer)
-
-        if check_matches and len(self.peers) >= 6 and len(known) <= len(self.peers) // 2:
-            return False
 
         if new_peers:
             source = source or new_peers[0].source
@@ -307,14 +322,13 @@ class PeerManager(object):
 
         # Process reported peers if remote peer is good
         peers = peers_task.result()
-        if await self._note_peers(peers, check_matches=not peer.is_tor):
-            features = self._features_to_register(peer, peers)
-            if features:
-                self.logger.info(f'registering ourself with {peer}')
-                # We only care to wait for the response
-                await session.send_request('server.add_peer', [features])
-        else:
-            raise BadPeerError('potential sybil detected')
+        await self._note_peers(peers)
+
+        features = self._features_to_register(peer, peers)
+        if features:
+            self.logger.info(f'registering ourself with {peer}')
+            # We only care to wait for the response
+            await session.send_request('server.add_peer', [features])
 
     async def _send_headers_subscribe(self, session, peer, ptuple):
         message = 'blockchain.headers.subscribe'
@@ -401,6 +415,7 @@ class PeerManager(object):
         forever = Event()
         async with self.group as group:
             await group.spawn(forever.wait())
+            await group.spawn(self._refresh_blacklist())
             await group.spawn(self._detect_proxy())
             await group.spawn(self._import_peers())
             # Consume tasks as they complete, logging unexpected failures
@@ -464,7 +479,7 @@ class PeerManager(object):
 
         return permit
 
-    def on_peers_subscribe(self, is_tor):
+    def on_peers_subscribe(self, is_tor, is_peer):
         '''Returns the server peers as a list of (ip, host, details) tuples.
 
         We return all peers we've connected to in the last day.
@@ -476,6 +491,13 @@ class PeerManager(object):
                   if peer.last_good > cutoff and
                   not peer.bad and peer.is_public]
         onion_peers = []
+
+        def is_blacklisted(host):
+            return any(item in self.blacklist
+                       for item in (host, '*.' + '.'.join(host.split('.')[-2:])))
+
+        if not is_peer:
+            recent = [peer for peer in recent if not is_blacklisted(peer.host)]
 
         # Always report ourselves if valid (even if not public)
         peers = set(myself for myself in self.myselves
