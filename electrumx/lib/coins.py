@@ -1304,6 +1304,8 @@ class Koto(Coin):
     HDR_SIZE = 80
     SAPLING_HDR_SIZE = 112
     SAPLING_HEIGHT = 556500
+    BLACKLIST_URL = 'https://electrum.kotocoin.info/blacklist.json'
+    DEFAULT_MAX_SEND = 10000000
     PEERS = [
         'fr.kotocoin.info s t',
         'electrum.kotocoin.info s t',
