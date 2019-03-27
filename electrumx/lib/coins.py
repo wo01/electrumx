@@ -2911,3 +2911,57 @@ class Onixcoin(Coin):
         '''Given a header return the hash.'''
         import x11_hash
         return x11_hash.getPoWHash(header)
+
+
+class Electra(Coin):
+    NAME = "Electra"
+    SHORTNAME = "ECA"
+    NET = "mainnet"
+    XPUB_VERBYTES = bytes.fromhex("0488b21e")
+    XPRV_VERBYTES = bytes.fromhex("0488ade4")
+    P2PKH_VERBYTE = bytes.fromhex("21")
+    P2SH_VERBYTES = [bytes.fromhex("28")]
+    WIF_BYTE = bytes.fromhex("A1")
+    GENESIS_HASH = ('00000f98da995de0ef1665c7d3338687'
+                    '923c1199230a44ecbdb5cec9306e4f4e')
+    RPC_PORT = 5788
+    TX_COUNT = 615729
+    TX_COUNT_HEIGHT = 205243
+    TX_PER_BLOCK = 3
+    REORG_LIMIT = 100
+    DESERIALIZER = lib_tx.DeserializerElectra
+
+    @classmethod
+    def header_hash(cls, header):
+        '''Given a header return the hash.'''
+        version, = util.unpack_le_uint32_from(header)
+        import nist5_hash
+
+        if version != 8:
+            return nist5_hash.getPoWHash(header)
+        else:
+            return double_sha256(header)
+
+
+class ECCoin(Coin):
+    NAME = "ECCoin"
+    SHORTNAME = "ECC"
+    NET = "mainnet"
+    DESERIALIZER = lib_tx.DeserializerECCoin
+    XPUB_VERBYTES = bytes.fromhex("0488b21e")
+    XPRV_VERBYTES = bytes.fromhex("0488ade4")
+    P2PKH_VERBYTE = bytes.fromhex("21")
+    P2SH_VERBYTES = [bytes.fromhex("08")]
+    WIF_BYTE = bytes.fromhex("80")
+    GENESIS_HASH = ('a60ac43c88dbc44b826cf315352a8a7b373d2af8b6e1c4c4a0638859c5e9ecd1')
+    TX_COUNT = 4661197
+    TX_COUNT_HEIGHT = 2114846
+    TX_PER_BLOCK = 10
+    VALUE_PER_COIN = 1000000
+    RPC_PORT = 19119
+
+    @classmethod
+    def header_hash(cls, header):
+        # you have to install scryp python module (pip install scrypt)
+        import scrypt
+        return scrypt.hash(header, header, 1024, 1, 1, 32)
