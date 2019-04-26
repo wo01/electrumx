@@ -72,6 +72,11 @@ These environment variables are optional:
   <https://docs.python.org/3/library/logging.html#logrecord-attributes>`_
   to use.  Defaults to ``%(levelname)s:%(name)s:%(message)s``.
 
+.. envvar:: LOG_LEVEL
+
+  The default Python logging level, a case-insensitive string.  Useful values
+  are 'debug', 'info', 'warning' and 'error'.
+
 .. envvar:: ALLOW_ROOT
 
   Set this environment variable to anything non-empty to allow running
@@ -246,40 +251,69 @@ raise them.
   hexadecimal ASCII characters on the wire.  Very few transactions on
   Bitcoin mainnet are over 500KB in size.
 
-.. envvar:: MAX_SUBS
+.. envvar:: COST_SOFT_LIMIT
+.. envvar:: COST_HARD_LIMIT
+.. envvar:: REQUEST_SLEEP
+.. envvar:: INITIAL_CONCURRENT
 
-  The maximum number of address subscriptions across all sessions.
-  Defaults to 250,000.
+  All values are integers. :envvar:`COST_SOFT_LIMIT` defaults to :const:`1,000`,
+  :envvar:`COST_HARD_LIMIT` to :const:`10,000`, :envvar:`REQUEST_SLEEP` to :const:`2,500`
+  milliseconds, and :envvar:`INITIAL_CONCURRENT` to :const:`10` concurrent requests.
 
-.. envvar:: MAX_SESSION_SUBS
+  The server prices each request made to it based upon an estimate of the resources needed
+  to process it.  Factors include whether the request uses bitcoind, how much bandwidth
+  it uses, and how hard it hits the databases.
 
-  The maximum number of address subscriptions permitted to a single
-  session.  Defaults to 50,000.
+  To set a base for the units, a :func:`blockchain.scripthash.subscribe` subscription to
+  an address with a history of 2 or fewer transactions is costed at :const:`1.0` before
+  considering the bandwidth consumed.  :func:`server.ping` is costed at :const:`0.1`.
 
-.. envvar:: BANDWIDTH_LIMIT
+  As the total cost of a session goes over the soft limit, its requests start to be
+  throttled in two ways.  First, the number of requests for that session that the server
+  will process concurrently is reduced.  Second, each request starts to sleep a little
+  before being handled.
 
-  Per-session periodic bandwidth usage limit in bytes.  This is a soft,
-  not hard, limit.  Currently the period is hard-coded to be one hour.
-  The default limit value is 2 million bytes.
+  Before throttling starts, the server will process up to :envvar:`INITIAL_CONCURRENT`
+  requests concurrently without sleeping.  As the session cost ranges from
+  :envvar:`COST_SOFT_LIMIT` to :envvar:`COST_HARD_LIMIT`, concurrency drops linearly to
+  zero and each request's sleep time increases linearly up to :envvar:`REQUEST_SLEEP`
+  milliseconds.  Once the hard limit is reached, the session is disconnected.
 
-  Bandwidth usage over each period is totalled, and when this limit is
-  exceeded each subsequent request is stalled by sleeping before
-  handling it, effectively giving higher processing priority to other
-  sessions.
+  In order that non-abusive sessions can continue to be served, a session's cost gradually
+  decays over time.  Subscriptions have an ongoing servicing cost, so the decay is slower
+  as the number of subscriptions increases.
 
-  The more bandwidth usage exceeds this soft limit the longer the next
-  request will sleep.  Sleep times are a round number of seconds with
-  a minimum of 1.  Each time the delay changes the event is logged.
+  If a session disconnects, ElectrumX continues to associate its cost with its IP address,
+  so if it immediately reconnects it will re-acquire its previous cost allocation.
 
-  Bandwidth usage is gradually reduced over time by "refunding" a
-  proportional part of the limit every now and then.
+  A server operator should experiment with different values according to server loads.  It
+  is not necessarily true that e.g. having a low soft limit, decreasing concurrency and
+  increasing sleep will help handling heavy loads, as it will also increase the backlog of
+  requests the server has to manage in memory.  It will also give a much worse experience
+  for genuine connections.
+
+.. envvar:: BANDWIDTH_UNIT_COST
+
+  The number of bytes, sent and received, by a session that is deemed to cost :const:`1.0`.
+
+  The default value :const:`5,000` bytes, meaning the bandwidth cost assigned to a response
+  of 100KB is 20.  If your bandwidth is cheap you should probably raise this.
+
+.. envvar:: REQUEST_TIMEOUT
+
+  An integer number of seconds defaulting to :const:`30`.  If a request takes longer than
+  this to respond to, either because of request limiting or because the request is
+  expensive, the server rejects it and returns a timeout error to the client indicating
+  that the server is busy.
+
+  This can help prevent large backlogs of unprocessed requests building up under heavy load.
 
 .. envvar:: SESSION_TIMEOUT
 
-  An integer number of seconds defaulting to 600.  Sessions with no
-  activity for longer than this are disconnected.  Properly
-  functioning Electrum clients by default will send pings roughly
-  every 60 seconds.
+  An integer number of seconds defaulting to :const:`600`.  Sessions that have not sent a
+  request for longer than this are disconnected.  Properly functioning clients should send
+  a :func:`server.ping` request once roughly 450 seconds have passed since the previous
+  request, in order to avoid disconnection.
 
 
 Peer Discovery

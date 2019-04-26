@@ -35,8 +35,8 @@ install:
   - pip install xevan_hash
   - pip install quark_hash
   - pip install groestlcoin_hash
-  - pip install git+https://github.com/goacoincore/neoscrypt
-  - pip install git+https://github.com/motioncrypto/x16r_hash
+  - pip install neoscrypt
+  - pip install x16r_hash
   - pip install pycryptodomex
   - pip install git+https://github.com/Electra-project/nist5_hash
 # command to run tests

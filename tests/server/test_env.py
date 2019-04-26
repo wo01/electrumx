@@ -196,12 +196,24 @@ def test_RPC_PORT():
     assert_integer('RPC_PORT', 'rpc_port', 8000)
 
 
-def test_MAX_SUBSCRIPTIONS():
-    assert_integer('MAX_SUBSCRIPTIONS', 'max_subscriptions', 10000)
+def test_COST_HARD_LIMIT():
+    assert_integer('COST_HARD_LIMIT', 'cost_hard_limit', 10000)
 
 
-def test_LOG_SESSIONS():
-    assert_integer('LOG_SESSIONS', 'log_sessions', 3600)
+def test_COST_SOFT_LIMIT():
+    assert_integer('COST_SOFT_LIMIT', 'cost_soft_limit', 1000)
+
+
+def test_INITIAL_CONCURRENT():
+    assert_integer('INITIAL_CONCURRENT', 'initial_concurrent', 10)
+
+
+def test_REQUEST_SLEEP():
+    assert_integer('REQUEST_SLEEP', 'request_sleep', 2500)
+
+
+def test_BANDWIDTH_UNIT_COST():
+    assert_integer('BANDWIDTH_UNIT_COST', 'bw_unit_cost', 5000)
 
 
 def test_DONATION_ADDRESS():
@@ -216,8 +228,13 @@ def test_MAX_SEND():
     assert_integer('MAX_SEND', 'max_send', 1000000)
 
 
-def test_MAX_SUBS():
-    assert_integer('MAX_SUBS', 'max_subs', 250000)
+def test_LOG_LEVEL():
+    setup_base_env()
+    e = Env()
+    assert e.log_level == 'INFO'
+    os.environ['LOG_LEVEL'] = 'warning'
+    e = Env()
+    assert e.log_level == 'WARNING'
 
 
 def test_MAX_SESSIONS():
@@ -228,12 +245,8 @@ def test_MAX_SESSIONS():
     # Cannot test default as it may be lowered by the open file limit cap
 
 
-def test_MAX_SESSION_SUBS():
-    assert_integer('MAX_SESSION_SUBS', 'max_session_subs', 50000)
-
-
-def test_BANDWIDTH_LIMIT():
-    assert_integer('BANDWIDTH_LIMIT', 'bandwidth_limit', 2000000)
+def test_REQUEST_TIMEOUT():
+    assert_integer('REQUEST_TIMEOUT', 'request_timeout', 30)
 
 
 def test_SESSION_TIMEOUT():
