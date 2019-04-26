@@ -10,14 +10,15 @@
 
 import re
 from collections import namedtuple
-from ipaddress import ip_address
+from ipaddress import IPv4Address, IPv6Address
 
+from aiorpcx import classify_host
 from electrumx.lib.coins import Coin
 from electrumx.lib.env_base import EnvBase
 import electrumx.lib.util as lib_util
 
 
-NetIdentity = namedtuple('NetIdentity', 'host tcp_port ssl_port nick_suffix')
+NetIdentity = namedtuple('NetIdentity', 'host tcp_port ssl_port')
 
 
 class Env(EnvBase):
@@ -27,7 +28,7 @@ class Env(EnvBase):
     '''
 
     # Peer discovery
-    PD_OFF, PD_SELF, PD_ON = range(3)
+    PD_OFF, PD_SELF, PD_ON = ('OFF', 'SELF', 'ON')
 
     def __init__(self, coin=None):
         super().__init__()
@@ -110,13 +111,15 @@ class Env(EnvBase):
         if host is None:
             return None
         try:
-            ip = ip_address(host)
+            host = classify_host(host)
         except ValueError:
-            bad = (not lib_util.is_valid_hostname(host)
-                   or host.lower() == 'localhost')
+            bad = True
         else:
-            bad = (ip.is_multicast or ip.is_unspecified
-                   or (ip.is_private and self.peer_announce))
+            if isinstance(host, (IPv4Address, IPv6Address)):
+                bad = (host.is_multicast or host.is_unspecified
+                       or (host.is_private and self.peer_announce))
+            else:
+                bad = host.lower() == 'localhost'
         if bad:
             raise self.Error('"{}" is not a valid REPORT_HOST'.format(host))
         tcp_port = self.integer('REPORT_TCP_PORT', self.tcp_port) or None
@@ -125,10 +128,9 @@ class Env(EnvBase):
             raise self.Error('REPORT_TCP_PORT and REPORT_SSL_PORT '
                              'both resolve to {}'.format(tcp_port))
         return NetIdentity(
-            host,
+            str(host),
             tcp_port,
             ssl_port,
-            ''
         )
 
     def tor_identity(self, clearnet):
@@ -159,7 +161,6 @@ class Env(EnvBase):
             host,
             tcp_port,
             ssl_port,
-            '_tor',
         )
 
     def hosts_dict(self):

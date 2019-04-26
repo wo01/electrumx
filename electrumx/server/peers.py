@@ -8,18 +8,18 @@
 '''Peer management.'''
 
 import asyncio
+from ipaddress import IPv4Address, IPv6Address
+import json
 import random
 import socket
 import ssl
 import time
-import json
-import aiohttp
 from collections import defaultdict, Counter
 
-from aiorpcx import (Connector, RPCSession, SOCKSProxy,
-                     Notification, handler_invocation,
+import aiohttp
+from aiorpcx import (Connector, RPCSession, SOCKSProxy, Notification, handler_invocation,
                      SOCKSError, RPCError, TaskTimeout, TaskGroup, Event,
-                     sleep, ignore_after, timeout_after)
+                     sleep, ignore_after)
 
 from electrumx.lib.peer import Peer
 from electrumx.lib.util import class_logger
@@ -52,7 +52,7 @@ class PeerSession(RPCSession):
             await handler_invocation(None, request)   # Raises
 
 
-class PeerManager(object):
+class PeerManager:
     '''Looks after the DB of peer network servers.
 
     Attempts to maintain a connection with up to 8 peers.
@@ -176,8 +176,7 @@ class PeerManager(object):
         '''Detect a proxy if we don't have one and some time has passed since
         the last attempt.
 
-        If found self.proxy is set to a SOCKSProxy instance, otherwise
-        None.
+        If found self.proxy is set to a SOCKSProxy instance, otherwise None.
         '''
         host = self.env.tor_proxy_host
         if self.env.tor_proxy_port is None:
@@ -187,7 +186,7 @@ class PeerManager(object):
         while True:
             self.logger.info(f'trying to detect proxy on "{host}" '
                              f'ports {ports}')
-            proxy = await SOCKSProxy.auto_detect_host(host, ports, None)
+            proxy = await SOCKSProxy.auto_detect_at_host(host, ports, None)
             if proxy:
                 self.proxy = proxy
                 self.logger.info(f'detected {proxy}')
@@ -324,9 +323,9 @@ class PeerManager(object):
     async def _verify_peer(self, session, peer):
         # store IP address for peer
         if not peer.is_tor:
-            address = session.peer_address()
-            if address:
-                peer.ip_addr = address[0]
+            address = session.remote_address()
+            if isinstance(address.host, (IPv4Address, IPv6Address)):
+                peer.ip_addr = str(address.host)
 
         if self._is_blacklisted(peer):
             raise BadPeerError('blacklisted')
@@ -351,7 +350,7 @@ class PeerManager(object):
                 raise BadPeerError('too many onion peers already')
         else:
             bucket = peer.bucket_for_internal_purposes()
-            if len(buckets[bucket]) > 0:
+            if buckets[bucket]:
                 raise BadPeerError(f'too many peers already in bucket {bucket}')
 
         # server.version goes first
@@ -413,7 +412,7 @@ class PeerManager(object):
         hosts = [host.lower() for host in features.get('hosts', {})]
         if self.env.coin.GENESIS_HASH != features.get('genesis_hash'):
             raise BadPeerError('incorrect genesis hash')
-        elif peer.host.lower() in hosts:
+        if peer.host.lower() in hosts:
             peer.update_features(features)
         else:
             raise BadPeerError(f'not listed in own hosts list {hosts}')
@@ -444,15 +443,16 @@ class PeerManager(object):
           2) Verifying connectivity of new peers.
           3) Retrying old peers at regular intervals.
         '''
+        self.logger.info(f'peer discovery: {self.env.peer_discovery}')
         if self.env.peer_discovery != self.env.PD_ON:
             self.logger.info('peer discovery is disabled')
             return
 
-        self.logger.info(f'beginning peer discovery. Force use of '
-                         f'proxy: {self.env.force_proxy}')
-        forever = Event()
+        self.logger.info(f'announce ourself: {self.env.peer_announce}')
+        self.logger.info(f'my clearnet self: {self._my_clearnet_peer()}')
+        self.logger.info(f'force use of proxy: {self.env.force_proxy}')
+        self.logger.info(f'beginning peer discovery...')
         async with self.group as group:
-            await group.spawn(forever.wait())
             await group.spawn(self._refresh_blacklist())
             await group.spawn(self._detect_proxy())
             await group.spawn(self._import_peers())
@@ -473,14 +473,14 @@ class PeerManager(object):
         '''Add a peer passed by the admin over LocalRPC.'''
         await self._note_peers([Peer.from_real_name(real_name, 'RPC')])
 
-    async def on_add_peer(self, features, source_info):
+    async def on_add_peer(self, features, source_addr):
         '''Add a peer (but only if the peer resolves to the source).'''
         if self.env.peer_discovery != self.env.PD_ON:
             return False
-        if not source_info:
+        if not source_addr:
             self.logger.info('ignored add_peer request: no source info')
             return False
-        source = source_info[0]
+        source = str(source_addr.host)
         peers = Peer.peers_from_features(features, source)
         if not peers:
             self.logger.info('ignored add_peer request: no peers given')
@@ -558,10 +558,10 @@ class PeerManager(object):
 
         return [peer.to_tuple() for peer in peers]
 
-    def proxy_peername(self):
-        '''Return the peername of the proxy, if there is a proxy, otherwise
+    def proxy_address(self):
+        '''Return the NetAddress of the proxy, if there is a proxy, otherwise
         None.'''
-        return self.proxy.peername if self.proxy else None
+        return self.proxy.address if self.proxy else None
 
     def rpc_data(self):
         '''Peer data for the peers RPC method.'''

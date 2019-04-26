@@ -14,19 +14,18 @@ import itertools
 import json
 import math
 import os
-import pylru
 import ssl
 import time
 from collections import defaultdict
 from functools import partial
-from ipaddress import ip_address
+from ipaddress import ip_address, IPv4Address, IPv6Address
 
 import attr
 from aiorpcx import (
     RPCSession, JSONRPCAutoDetect, JSONRPCConnection,
-    TaskGroup, handler_invocation, RPCError, Request, sleep, Event,
-    ExcessiveSessionCostError, FinalRPCError, NewlineFramer
+    TaskGroup, handler_invocation, RPCError, Request, sleep, Event, ReplyAndDisconnect, NewlineFramer
 )
+import pylru
 
 import electrumx
 from electrumx.lib.merkle import MerkleCache
@@ -251,7 +250,7 @@ class SessionManager(object):
     async def _recalc_concurrency(self):
         '''Periodically recalculate session concurrency.'''
         session_class = self.env.coin.SESSIONCLS
-        period = 100
+        period = 300
         while True:
             await sleep(period)
             hard_limit = session_class.cost_hard_limit
@@ -267,16 +266,12 @@ class SessionManager(object):
             for group in dead_groups:
                 self.session_groups.pop(group.name)
 
-            sessions_to_close = []
+            # Recalc concurrency for sessions where cost is changing gradually, and update
+            # cost_decay_per_sec.
             for session in self.sessions:
                 # Subs have an on-going cost so decay more slowly with more subs
                 session.cost_decay_per_sec = hard_limit / (10000 + 5 * session.sub_count())
-                try:
-                    session.recalc_concurrency()
-                except ExcessiveSessionCostError:
-                    sessions_to_close.append(session)
-            await self._disconnect_sessions(sessions_to_close, 'closing expensive')
-            del sessions_to_close
+                session.recalc_concurrency()
 
     def _get_info(self):
         '''A summary of server state.'''
@@ -318,7 +313,7 @@ class SessionManager(object):
         sessions = sorted(self.sessions, key=lambda s: s.start_time)
         return [(session.session_id,
                  session.flags(),
-                 session.peer_address_str(for_log=for_log),
+                 session.remote_address_string(for_log=for_log),
                  session.client,
                  session.protocol_version_string(),
                  session.cost,
@@ -753,14 +748,12 @@ class SessionManager(object):
             await self._task_group.spawn(session.notify, touched, height_changed)
 
     def _ip_addr_group_name(self, session):
-        ip_addr = session.peer_address()
-        if not ip_addr:
-            return 'unknown_ip'
-        ip_addr = ip_addr[0]
-        if ':' in ip_addr:
-            ip_addr = ip_address(ip_addr)
-            return ':'.join(ip_addr.exploded.split(':')[:3])
-        return '.'.join(ip_addr.split('.')[:3])
+        host = session.remote_address().host
+        if isinstance(host, IPv4Address):
+            return '.'.join(str(host).split('.')[:3])
+        if isinstance(host, IPv6Address):
+            return ':'.join(host.exploded.split(':')[:3])
+        return 'unknown_addr'
 
     def _timeslice_name(self, session):
         return f't{int(session.start_time - self.start_time) // 300}'
@@ -824,12 +817,12 @@ class SessionBase(RPCSession):
     async def notify(self, touched, height_changed):
         pass
 
-    def peer_address_str(self, *, for_log=True):
+    def remote_address_string(self, *, for_log=True):
         '''Returns the peer's IP address and port as a human-readable
         string, respecting anon logs if the output is for a log.'''
         if for_log and self.anon_logs:
             return 'xx.xx.xx.xx:xx'
-        return super().peer_address_str()
+        return str(self.remote_address())
 
     def flags(self):
         '''Status flags.'''
@@ -848,8 +841,9 @@ class SessionBase(RPCSession):
         context = {'conn_id': f'{self.session_id}'}
         self.logger = util.ConnectionLogger(self.logger, context)
         self.session_mgr.add_session(self)
-        self.logger.info(f'{self.kind} {self.peer_address_str()}, '
+        self.logger.info(f'{self.kind} {self.remote_address_string()}, '
                          f'{self.session_mgr.session_count():,d} total')
+        self.recalc_concurrency()
 
     def connection_lost(self, exc):
         '''Handle client disconnection.'''
@@ -902,7 +896,7 @@ class ElectrumX(SessionBase):
         self.mempool_statuses = {}
         self.set_request_handlers(self.PROTOCOL_MIN)
         self.is_peer = False
-        self.recalc_concurrency()
+        self.cost = 5.0   # Connection cost
 
     @classmethod
     def protocol_min_max_strings(cls):
@@ -995,7 +989,7 @@ class ElectrumX(SessionBase):
         '''Add a peer (but only if the peer resolves to the source).'''
         self.is_peer = True
         self.bump_cost(100.0)
-        return await self.peer_mgr.on_add_peer(features, self.peer_address())
+        return await self.peer_mgr.on_add_peer(features, self.remote_address())
 
     async def peers_subscribe(self):
         '''Return the server peers as a list of (ip, host, details) tuples.'''
@@ -1175,11 +1169,10 @@ class ElectrumX(SessionBase):
     def is_tor(self):
         '''Try to detect if the connection is to a tor hidden service we are
         running.'''
-        peername = self.peer_mgr.proxy_peername()
-        if not peername:
+        proxy_address = self.peer_mgr.proxy_address()
+        if not proxy_address:
             return False
-        peer_address = self.peer_address()
-        return peer_address and peer_address[0] == peername[0]
+        return self.remote_address().host == proxy_address.host
 
     async def replaced_banner(self, banner):
         network_info = await self.daemon_request('getnetworkinfo')
@@ -1261,8 +1254,8 @@ class ElectrumX(SessionBase):
             client_name = str(client_name)
             if self.env.drop_client is not None and \
                     self.env.drop_client.match(client_name):
-                raise FinalRPCError(BAD_REQUEST,
-                                    f'unsupported client: {client_name}')
+                raise ReplyAndDisconnect(RPCError(
+                    BAD_REQUEST, f'unsupported client: {client_name}'))
             self.client = client_name[:17]
 
         # Find the highest common protocol version.  Disconnect if
@@ -1277,8 +1270,8 @@ class ElectrumX(SessionBase):
                 self.logger.info(f'client requested future protocol version '
                                  f'{util.version_string(client_min)} '
                                  f'- is your software out of date?')
-            raise FinalRPCError(BAD_REQUEST,
-                                f'unsupported protocol version: {protocol_version}')
+            raise ReplyAndDisconnect(RPCError(
+                BAD_REQUEST, f'unsupported protocol version: {protocol_version}'))
         self.set_request_handlers(ptuple)
 
         return (electrumx.version, self.protocol_version_string())
