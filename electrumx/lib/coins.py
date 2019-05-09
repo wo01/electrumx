@@ -406,12 +406,10 @@ class BitcoinSegwit(BitcoinMixin, Coin):
     PEERS = [
         'btc.smsys.me s995',
         'E-X.not.fyi s t',
-        'elec.luggs.co s443',
         'electrum.vom-stausee.de s t',
         'electrum.hsmiths.com s t',
         'helicarrier.bauerj.eu s t',
         'hsmiths4fyqlw5xw.onion s t',
-        'luggscoqbymhvnkp.onion t80',
         'ozahtqwp25chjdjd.onion s t',
         'node.arihanc.com s t',
         'arihancckjge66iv.onion s t',
@@ -616,13 +614,12 @@ class BitcoinSegwitTestnet(BitcoinTestnetMixin, Coin):
     DESERIALIZER = lib_tx.DeserializerSegWit
     CRASH_CLIENT_VER = (3, 2, 3)
     PEERS = [
-        'electrum.akinbo.org s t',
-        'he36kyperp3kbuxu.onion s t',
         'testnet.hsmiths.com t53011 s53012',
         'hsmithsxurybd7uh.onion t53011 s53012',
-        'testnetnode.arihanc.com s t',
-        'w3e2orjpiiv2qwem3dw66d7c4krink4nhttngkylglpqe5r22n6n5wid.onion s t',
         'testnet.qtornado.com s t',
+        'testnet1.bauerj.eu t50001 s50002',
+        'tn.not.fyi t55001 s55002',
+        'bitcoin.cluelessperson.com s t',
     ]
 
     @classmethod
@@ -679,7 +676,7 @@ class Litecoin(Coin):
     RPC_PORT = 9332
     REORG_LIMIT = 800
     PEERS = [
-        'elec.luggs.co s444',
+        'ex.lug.gs s444',
         'electrum-ltc.bysh.me s t',
         'electrum-ltc.ddns.net s t',
         'electrum-ltc.wilv.in s t',
@@ -853,7 +850,7 @@ class Namecoin(AuxPowMixin, Coin):
     TX_PER_BLOCK = 10
     RPC_PORT = 8336
     PEERS = [
-        'elec.luggs.co s446',
+        'ex.lug.gs s446',
         'luggscoqbymhvnkp.onion t82',
         'ulrichard.ch s50006 t50005',
     ]
@@ -2134,6 +2131,52 @@ class Xuez(Coin):
             return xevan_hash.getPoWHash(header)
 
 
+# Source: https://github.com/odinblockchain/odin
+class Odin(Coin):
+    NAME = "ODIN"
+    SHORTNAME = "ODIN"
+    NET = "mainnet"
+    XPUB_VERBYTES = bytes.fromhex("27561872")
+    XPRV_VERBYTES = bytes.fromhex("27256746")
+    P2PKH_VERBYTE = bytes.fromhex("73")
+    P2SH_VERBYTES = [bytes.fromhex("39")]
+    WIF_BYTE = bytes.fromhex("8a")
+    GENESIS_HASH = ('31ca29566549e444cf227a0e2e067aed'
+                    '847c2acc541d3bbf9ca1ae89f4fd57d7')
+
+    TX_COUNT = 340000
+    TX_COUNT_HEIGHT = 340000
+    TX_PER_BLOCK = 2
+    RPC_PORT = 22101
+    REORG_LIMIT = 100
+
+    BASIC_HEADER_SIZE = 80
+    HDR_V4_SIZE = 112
+    HDR_V4_HEIGHT = 143447
+    HDR_V4_START_OFFSET = HDR_V4_HEIGHT * BASIC_HEADER_SIZE
+
+    SESSIONCLS = DashElectrumX
+    DAEMON = daemon.DashDaemon
+
+    @classmethod
+    def static_header_offset(cls, height):
+        assert cls.STATIC_BLOCK_HEADERS
+        if height >= cls.HDR_V4_HEIGHT:
+            relative_v4_offset = (height - cls.HDR_V4_HEIGHT) * cls.HDR_V4_SIZE
+            return cls.HDR_V4_START_OFFSET + relative_v4_offset
+        else:
+            return height * cls.BASIC_HEADER_SIZE
+
+    @classmethod
+    def header_hash(cls, header):
+        version, = util.unpack_le_uint32_from(header)
+        if version >= 4:
+            return super().header_hash(header)
+        else:
+            import quark_hash
+            return quark_hash.getPoWHash(header)
+
+
 class Pac(Coin):
     NAME = "PAC"
     SHORTNAME = "PAC"
@@ -2862,6 +2905,33 @@ class RavencoinTestnet(Ravencoin):
     PEERS = [
         'rvn.satoshi.org.uk s t'
     ]
+
+
+class Bolivarcoin(Coin):
+    NAME = "Bolivarcoin"
+    SHORTNAME = "BOLI"
+    NET = "mainnet"
+    XPUB_VERBYTES = bytes.fromhex("0488B21E")
+    XPRV_VERBYTES = bytes.fromhex("0488ADE4")
+    P2PKH_VERBYTE = bytes.fromhex("55")
+    P2SH_VERBYTES = [bytes.fromhex("05")]
+    WIF_BYTE = bytes.fromhex("D5")
+    GENESIS_HASH = ('00000e4fc293a1912b9d73cbb8d8f727'
+                    '0007a7d84382f1370661e65d5d57b1f6')
+    TX_COUNT = 1082515
+    TX_COUNT_HEIGHT = 540410
+    TX_PER_BLOCK = 10
+    RPC_PORT = 3563
+    REORG_LIMIT = 800
+    PEERS = []
+    SESSIONCLS = DashElectrumX
+    DAEMON = daemon.DashDaemon
+
+    @classmethod
+    def header_hash(cls, header):
+        '''Given a header return the hash.'''
+        import x11_hash
+        return x11_hash.getPoWHash(header)
 
 
 class Onixcoin(Coin):
