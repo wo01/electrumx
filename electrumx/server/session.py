@@ -18,12 +18,12 @@ import ssl
 import time
 from collections import defaultdict
 from functools import partial
-from ipaddress import ip_address, IPv4Address, IPv6Address
+from ipaddress import IPv4Address, IPv6Address
 
 import attr
 from aiorpcx import (
-    RPCSession, JSONRPCAutoDetect, JSONRPCConnection,
-    TaskGroup, handler_invocation, RPCError, Request, sleep, Event, ReplyAndDisconnect, NewlineFramer
+    RPCSession, JSONRPCAutoDetect, JSONRPCConnection, serve_rs, serve_ws,
+    TaskGroup, handler_invocation, RPCError, Request, sleep, Event, ReplyAndDisconnect
 )
 import pylru
 
@@ -86,7 +86,7 @@ def assert_tx_hash(value):
 
 
 @attr.s(slots=True)
-class SessionGroup(object):
+class SessionGroup:
     name = attr.ib()
     weight = attr.ib()
     sessions = attr.ib()
@@ -100,7 +100,7 @@ class SessionGroup(object):
 
 
 @attr.s(slots=True)
-class SessionReferences(object):
+class SessionReferences:
     # All attributes are sets but groups is a list
     sessions = attr.ib()
     groups = attr.ib()
@@ -108,7 +108,7 @@ class SessionReferences(object):
     unknown = attr.ib()     # Strings
 
 
-class SessionManager(object):
+class SessionManager:
     '''Holds global state about all sessions.'''
 
     def __init__(self, env, db, bp, daemon, mempool, shutdown_event):
@@ -121,7 +121,7 @@ class SessionManager(object):
         self.peer_mgr = PeerManager(env, db)
         self.shutdown_event = shutdown_event
         self.logger = util.class_logger(__name__, self.__class__.__name__)
-        self.servers = {}
+        self.servers = {}           # service->server
         self.sessions = {}          # session->iterable of its SessionGroups
         self.session_groups = {}    # group name->SessionGroup instance
         self.txs_sent = 0
@@ -139,11 +139,8 @@ class SessionManager(object):
         self._merkle_hits = 0
         self.notified_height = None
         self.hsub_results = None
-        # Masternode stuff only for such coins
-        if issubclass(env.coin.SESSIONCLS, DashElectrumX):
-            self.mn_cache_height = 0
-            self.mn_cache = []
         self._task_group = TaskGroup()
+        self._sslc = None
         # Event triggered when electrumx is listening for incoming requests.
         self.server_listening = Event()
         self.session_event = Event()
@@ -154,50 +151,58 @@ class SessionManager(object):
         LocalRPC.request_handlers = {cmd: getattr(self, 'rpc_' + cmd)
                                      for cmd in cmds}
 
-    async def _start_server(self, kind, *args, **kw_args):
-        loop = asyncio.get_event_loop()
-        if kind == 'RPC':
-            protocol_class = LocalRPC
-        else:
-            protocol_class = self.env.coin.SESSIONCLS
-        protocol_factory = partial(protocol_class, self, self.db,
-                                   self.mempool, self.peer_mgr, kind)
-        server = loop.create_server(protocol_factory, *args, **kw_args)
+    def _ssl_context(self):
+        if self._sslc is None:
+            self._sslc = ssl.SSLContext(ssl.PROTOCOL_TLS)
+            self._sslc.load_cert_chain(self.env.ssl_certfile, keyfile=self.env.ssl_keyfile)
+        return self._sslc
 
-        host, port = args[:2]
-        try:
-            self.servers[kind] = await server
-        except OSError as e:    # don't suppress CancelledError
-            self.logger.error(f'{kind} server failed to listen on {host}:'
-                              f'{port:d} :{e!r}')
-        else:
-            self.logger.info(f'{kind} server listening on {host}:{port:d}')
+    async def _start_servers(self, services):
+        for service in services:
+            kind = service.protocol.upper()
+            if service.protocol in self.env.SSL_PROTOCOLS:
+                sslc = self._ssl_context()
+            else:
+                sslc = None
+            if service.protocol == 'rpc':
+                session_class = LocalRPC
+            else:
+                session_class = self.env.coin.SESSIONCLS
+            if service.protocol in ('ws', 'wss'):
+                serve = serve_ws
+            else:
+                serve = serve_rs
+            # FIXME: pass the service not the kind
+            session_factory = partial(session_class, self, self.db, self.mempool,
+                                      self.peer_mgr, kind)
+            host = None if service.host == 'all_interfaces' else str(service.host)
+            try:
+                self.servers[service] = await serve(session_factory, host,
+                                                    service.port, ssl=sslc)
+            except OSError as e:    # don't suppress CancelledError
+                self.logger.error(f'{kind} server failed to listen on {service.address}: {e}')
+            else:
+                self.logger.info(f'{kind} server listening on {service.address}')
 
     async def _start_external_servers(self):
         '''Start listening on TCP and SSL ports, but only if the respective
         port was given in the environment.
         '''
-        env = self.env
-        host = env.cs_host(for_rpc=False)
-        if env.tcp_port is not None:
-            await self._start_server('TCP', host, env.tcp_port)
-        if env.ssl_port is not None:
-            sslc = ssl.SSLContext(ssl.PROTOCOL_TLS)
-            sslc.load_cert_chain(env.ssl_certfile, keyfile=env.ssl_keyfile)
-            await self._start_server('SSL', host, env.ssl_port, ssl=sslc)
+        await self._start_servers(service for service in self.env.services
+                                  if service.protocol != 'rpc')
         self.server_listening.set()
 
-    async def _close_servers(self, kinds):
-        '''Close the servers of the given kinds (TCP etc.).'''
-        kinds = set(kinds).intersection(self.servers)
-        if kinds:
-            self.logger.info(f'closing down {", ".join(kinds)} listening servers')
-            servers = [self.servers.pop(kind) for kind in kinds]
-            # Close all before waiting
-            for server in servers:
-                server.close()
-            for server in servers:
-                await server.wait_closed()
+    async def _stop_servers(self, services):
+        '''Stop the servers of the given protocols.'''
+        server_map = {service: self.servers.pop(service)
+                      for service in set(services).intersection(self.servers)}
+        # Close all before waiting
+        for service, server in server_map.items():
+            self.logger.info(f'closing down server for {service}')
+            server.close()
+        # No value in doing these concurrently
+        for server in server_map.values():
+            await server.wait_closed()
 
     async def _manage_servers(self):
         paused = False
@@ -210,7 +215,8 @@ class SessionManager(object):
                 self.logger.info(f'maximum sessions {max_sessions:,d} '
                                  f'reached, stopping new connections until '
                                  f'count drops to {low_watermark:,d}')
-                await self._close_servers(['TCP', 'SSL'])
+                await self._stop_servers(service for service in self.servers
+                                         if service.protocol != 'rpc')
                 paused = True
             # Start listening for incoming connections if paused and
             # session count has fallen
@@ -296,7 +302,6 @@ class SessionManager(object):
                 'count with subs': sum(len(getattr(s, 'hashX_subs', ())) > 0 for s in sessions),
                 'errors': sum(s.errors for s in sessions),
                 'logged': len([s for s in sessions if s.log_me]),
-                'paused': sum(s.is_send_buffer_full() for s in sessions),
                 'pending requests': sum(s.unanswered_request_count() for s in sessions),
                 'subs': sum(s.sub_count() for s in sessions),
             },
@@ -555,9 +560,8 @@ class SessionManager(object):
         '''Start the RPC server if enabled.  When the event is triggered,
         start TCP and SSL servers.'''
         try:
-            if self.env.rpc_port is not None:
-                await self._start_server('RPC', self.env.cs_host(for_rpc=True),
-                                         self.env.rpc_port)
+            await self._start_servers(service for service in self.env.services
+                                      if service.protocol == 'rpc')
             await event.wait()
 
             session_class = self.env.coin.SESSIONCLS
@@ -582,6 +586,8 @@ class SessionManager(object):
             if self.env.drop_client is not None:
                 self.logger.info('drop clients matching: {}'
                                  .format(self.env.drop_client.pattern))
+            for service in self.env.report_services:
+                self.logger.info(f'advertising service {service}')
             # Start notifications; initialize hsub_results
             await notifications.start(self.db.db_height, self._notify_sessions)
             await self._start_external_servers()
@@ -595,7 +601,7 @@ class SessionManager(object):
                 await group.spawn(self._manage_servers())
         finally:
             # Close servers then sessions
-            await self._close_servers(list(self.servers.keys()))
+            await self._stop_servers(self.servers.keys())
             async with TaskGroup() as group:
                 for session in list(self.sessions):
                     await group.spawn(session.close(force_after=1))
@@ -796,10 +802,9 @@ class SessionBase(RPCSession):
     session_counter = itertools.count()
     log_new = False
 
-    def __init__(self, session_mgr, db, mempool, peer_mgr, kind):
+    def __init__(self, session_mgr, db, mempool, peer_mgr, kind, transport):
         connection = JSONRPCConnection(JSONRPCAutoDetect)
-        super().__init__(connection=connection, framer=NewlineFramer(max_size=250*40000))
-        self.logger = util.class_logger(__name__, self.__class__.__name__)
+        super().__init__(transport, connection=connection)
         self.session_mgr = session_mgr
         self.db = db
         self.mempool = mempool
@@ -813,6 +818,14 @@ class SessionBase(RPCSession):
         self.log_me = SessionBase.log_new
         self.session_id = None
         self.daemon_request = self.session_mgr.daemon_request
+        self.session_id = next(self.session_counter)
+        context = {'conn_id': f'{self.session_id}'}
+        logger = util.class_logger(__name__, self.__class__.__name__)
+        self.logger = util.ConnectionLogger(logger, context)
+        self.logger.info(f'{self.kind} {self.remote_address_string()}, '
+                         f'{self.session_mgr.session_count():,d} total')
+        self.recalc_concurrency()
+        self.session_mgr.add_session(self)
 
     async def notify(self, touched, height_changed):
         pass
@@ -834,27 +847,11 @@ class SessionBase(RPCSession):
         status += str(self._incoming_concurrency.max_concurrent)
         return status
 
-    def connection_made(self, transport):
-        '''Handle an incoming client connection.'''
-        super().connection_made(transport)
-        self.session_id = next(self.session_counter)
-        context = {'conn_id': f'{self.session_id}'}
-        self.logger = util.ConnectionLogger(self.logger, context)
-        self.session_mgr.add_session(self)
-        self.logger.info(f'{self.kind} {self.remote_address_string()}, '
-                         f'{self.session_mgr.session_count():,d} total')
-        self.recalc_concurrency()
-
-    def connection_lost(self, exc):
+    async def connection_lost(self):
         '''Handle client disconnection.'''
-        try:
-            self.session_mgr.remove_session(self)
-        except KeyError:
-            # uvloop has a bug where connection_lost() is called without a connection_made()
-            return
+        await super().connection_lost()
+        self.session_mgr.remove_session(self)
         msg = ''
-        if self.is_send_buffer_full():
-            msg += ' with full socket buffer'
         if self._incoming_concurrency.max_concurrent < self.initial_concurrent * 0.8:
             msg += ' whilst throttled'
         if self.send_size >= 1_000_000:
@@ -862,7 +859,6 @@ class SessionBase(RPCSession):
         if msg:
             msg = 'disconnected' + msg
             self.logger.info(msg)
-        super().connection_lost(exc)
 
     def sub_count(self):
         return 0
@@ -906,15 +902,22 @@ class ElectrumX(SessionBase):
     @classmethod
     def server_features(cls, env):
         '''Return the server features dictionary.'''
+        hosts_dict = {}
+        for service in env.report_services:
+            port_dict = hosts_dict.setdefault(str(service.host), {})
+            if service.protocol not in port_dict:
+                port_dict[f'{service.protocol}_port'] = service.port
+
         min_str, max_str = cls.protocol_min_max_strings()
         return {
-            'hosts': env.hosts_dict(),
+            'hosts': hosts_dict,
             'pruning': None,
             'server_version': electrumx.version,
             'protocol_min': min_str,
             'protocol_max': max_str,
             'genesis_hash': env.coin.GENESIS_HASH,
             'hash_function': 'sha256',
+            'services': [str(service) for service in env.report_services],
         }
 
     async def server_features_async(self):
@@ -1428,6 +1431,8 @@ class DashElectrumX(ElectrumX):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.mns = set()
+        self.mn_cache_height = 0
+        self.mn_cache = []
 
     def set_request_handlers(self, ptuple):
         super().set_request_handlers(ptuple)
