@@ -1414,7 +1414,7 @@ class Koto(Coin):
                      'timestamp', 'bits', 'nonce')
     HEADER_UNPACK = struct.Struct('< I 32s 32s I I I').unpack_from
     SAPLING_HEADER_VALUES = ('version', 'prev_block_hash', 'merkle_root',
-                     'timestamp', 'bits', 'nonce', 'final_sapling_root')
+                             'timestamp', 'bits', 'nonce', 'final_sapling_root')
     SAPLING_HEADER_UNPACK = struct.Struct('< I 32s 32s I I I 32s').unpack_from
     TX_COUNT = 158914
     TX_COUNT_HEIGHT = 67574

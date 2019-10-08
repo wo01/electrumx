@@ -629,7 +629,8 @@ class SessionManager:
         cost = tx_hash_count
 
         if self.env.coin.NAME == "Koto":
-            txes = [await self.daemon_request('getrawtransaction', hash_to_hex_str(hash), True) for hash in tx_hashes]
+            txes = [await self.daemon_request('getrawtransaction',
+                                              hash_to_hex_str(hash), True) for hash in tx_hashes]
             merkle_hashes = [hex_str_to_hash(tx['hash']) for tx in txes]
             tx_hashes = merkle_hashes
 
