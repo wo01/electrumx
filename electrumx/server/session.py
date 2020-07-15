@@ -126,13 +126,13 @@ class SessionManager:
         self.txs_sent = 0
         self.start_time = time.time()
         self._method_counts = defaultdict(int)
+        self._reorg_count = 0
         self._history_cache = pylru.lrucache(1000)
         self._history_lookups = 0
         self._history_hits = 0
         self._tx_hashes_cache = pylru.lrucache(1000)
         self._tx_hashes_lookups = 0
         self._tx_hashes_hits = 0
-        self._cache_counter = 0
         # Really a MerkleCache cache
         self._merkle_cache = pylru.lrucache(1000)
         self._merkle_lookups = 0
@@ -252,6 +252,15 @@ class SessionManager:
                               if session.last_recv < stale_cutoff]
             await self._disconnect_sessions(stale_sessions, 'closing stale')
             del stale_sessions
+
+    async def _handle_chain_reorgs(self):
+        '''Clear caches on chain reorgs.'''
+        while True:
+            await self.bp.backed_up_event.wait()
+            self.logger.info(f'reorg signalled; clearing tx_hashes and merkle caches')
+            self._reorg_count += 1
+            self._tx_hashes_cache.clear()
+            self._merkle_cache.clear()
 
     async def _recalc_concurrency(self):
         '''Periodically recalculate session concurrency.'''
@@ -606,6 +615,7 @@ class SessionManager:
             async with self._task_group as group:
                 await group.spawn(self.peer_mgr.discover_peers())
                 await group.spawn(self._clear_stale_sessions())
+                await group.spawn(self._handle_chain_reorgs())
                 await group.spawn(self._recalc_concurrency())
                 await group.spawn(self._log_sessions())
                 await group.spawn(self._manage_servers())
@@ -625,7 +635,7 @@ class SessionManager:
             return 0
         return sum((group.cost() - session.cost) * group.weight for group in groups)
 
-    async def _merkle_branch(self, height, tx_hashes, tx_pos, cache_counter):
+    async def _merkle_branch(self, height, tx_hashes, tx_pos):
         tx_hash_count = len(tx_hashes)
         cost = tx_hash_count
 
@@ -646,8 +656,7 @@ class SessionManager:
                     return tx_hashes[start: start + count]
 
                 merkle_cache = MerkleCache(self.db.merkle, tx_hashes_func)
-                if cache_counter == self._cache_counter:
-                    self._merkle_cache[height] = merkle_cache
+                self._merkle_cache[height] = merkle_cache
                 await merkle_cache.initialize(len(tx_hashes))
             branch, _root = await merkle_cache.branch_and_root(tx_hash_count, tx_pos)
         else:
@@ -658,50 +667,51 @@ class SessionManager:
 
     async def merkle_branch_for_tx_hash(self, height, tx_hash):
         '''Return a triple (branch, tx_pos, cost).'''
-        tx_hashes, tx_hashes_cost, cache_counter = await self.tx_hashes_at_blockheight(height)
+        tx_hashes, tx_hashes_cost = await self.tx_hashes_at_blockheight(height)
         try:
             tx_pos = tx_hashes.index(tx_hash)
         except ValueError:
             raise RPCError(BAD_REQUEST,
                            f'tx {hash_to_hex_str(tx_hash)} not in block at height {height:,d}')
-        branch, merkle_cost = await self._merkle_branch(height, tx_hashes, tx_pos, cache_counter)
+        branch, merkle_cost = await self._merkle_branch(height, tx_hashes, tx_pos)
         return branch, tx_pos, tx_hashes_cost + merkle_cost
 
     async def merkle_branch_for_tx_pos(self, height, tx_pos):
         '''Return a triple (branch, tx_hash_hex, cost).'''
-        tx_hashes, tx_hashes_cost, cache_counter = await self.tx_hashes_at_blockheight(height)
+        tx_hashes, tx_hashes_cost = await self.tx_hashes_at_blockheight(height)
         try:
             tx_hash = tx_hashes[tx_pos]
         except IndexError:
             raise RPCError(BAD_REQUEST,
                            f'no tx at position {tx_pos:,d} in block at height {height:,d}')
-        branch, merkle_cost = await self._merkle_branch(height, tx_hashes, tx_pos, cache_counter)
+        branch, merkle_cost = await self._merkle_branch(height, tx_hashes, tx_pos)
         return branch, hash_to_hex_str(tx_hash), tx_hashes_cost + merkle_cost
 
     async def tx_hashes_at_blockheight(self, height):
-        '''Returns a tuple (tx_hashes, cost, cache_counter).
+        '''Returns a pair (tx_hashes, cost).
 
         tx_hashes is an ordered list of binary hashes, cost is an estimated cost of
         getting the hashes; cheaper if in-cache.  Raises RPCError.
-
-        If cache_counter differs from self._cache_counter, values must not be cached.
         '''
-        cache_counter = self._cache_counter
         self._tx_hashes_lookups += 1
         tx_hashes = self._tx_hashes_cache.get(height)
         if tx_hashes:
             self._tx_hashes_hits += 1
-            return tx_hashes, 0.1, cache_counter
+            return tx_hashes, 0.1
 
-        try:
-            tx_hashes = await self.db.tx_hashes_at_blockheight(height)
-        except self.db.DBError as e:
-            raise RPCError(BAD_REQUEST, f'db error: {e!r}')
+        # Ensure the tx_hashes are fresh before placing in the cache
+        while True:
+            reorg_count = self._reorg_count
+            try:
+                tx_hashes = await self.db.tx_hashes_at_blockheight(height)
+            except self.db.DBError as e:
+                raise RPCError(BAD_REQUEST, f'db error: {e!r}')
+            if reorg_count == self._reorg_count:
+                break
 
-        if cache_counter == self._cache_counter:
-            self._tx_hashes_cache[height] = tx_hashes
+        self._tx_hashes_cache[height] = tx_hashes
 
-        return tx_hashes, 0.25 + len(tx_hashes) * 0.0001, cache_counter
+        return tx_hashes, 0.25 + len(tx_hashes) * 0.0001
 
     def session_count(self):
         '''The number of connections that we've sent something to.'''
@@ -752,14 +762,6 @@ class SessionManager:
 
     async def _notify_sessions(self, height, touched):
         '''Notify sessions about height changes and touched addresses.'''
-        # Invalidate our height-based caches in case of a reorg.  Increment the cache
-        # counter so that our invalidation of them isn't concurrently itself overwritten
-        self._cache_counter += 1
-        for cache in (self._tx_hashes_cache, self._merkle_cache):
-            for key in range(height, self.db.db_height + 1):
-                if key in cache:
-                    del cache[key]
-
         height_changed = height != self.notified_height
         if height_changed:
             await self._refresh_hsub_results(height)
@@ -1243,15 +1245,19 @@ class ElectrumX(SessionBase):
         self.bump_cost(1.0)
         return await self.daemon_request('relayfee')
 
-    async def estimatefee(self, number):
+    async def estimatefee(self, number, mode=None):
         '''The estimated transaction fee per kilobyte to be paid for a
         transaction to be included within a certain number of blocks.
 
         number: the number of blocks
+        mode: CONSERVATIVE or ECONOMICAL estimation mode
         '''
         number = non_negative_integer(number)
         self.bump_cost(2.0)
-        return await self.daemon_request('estimatefee', number)
+        if mode:
+            return await self.daemon_request('estimatefee', number, mode)
+        else:
+            return await self.daemon_request('estimatefee', number)
 
     async def ping(self):
         '''Serves as a connection keep-alive mechanism and for the client to
@@ -1384,7 +1390,7 @@ class ElectrumX(SessionBase):
             self.bump_cost(cost)
             return {"tx_hash": tx_hash, "merkle": branch}
         else:
-            tx_hashes, cost, _ = await self.session_mgr.tx_hashes_at_blockheight(height)
+            tx_hashes, cost = await self.session_mgr.tx_hashes_at_blockheight(height)
             try:
                 tx_hash = tx_hashes[tx_pos]
             except IndexError:

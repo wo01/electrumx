@@ -65,7 +65,8 @@ Subscribe to a script hash.
   are sent with :func:`mempool.changes` notifications.  When confirmed
   history changes, a notification with signature
 
-    .. function:: blockchain_.scripthash.subscribe(scripthash, tx_hash)
+    .. function:: blockchain.scripthash.subscribe(scripthash, tx_hash)
+       :noindex:
 
   is sent, where *tx_hash* is the hash of the last confirmed
   transaction in blockchain order.
@@ -106,7 +107,7 @@ hashes>`.
 
   * *history*
 
-    A list ot transactions.  Each transaction is itself a list of
+    A list of transactions.  Each transaction is itself a list of
     two elements:
 
       1. The block height
