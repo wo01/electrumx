@@ -1486,6 +1486,7 @@ class Koto(Coin):
         'fr.kotocoin.info s t',
         'electrum.kotocoin.info s t',
     ]
+
     @classmethod
     def electrum_header(cls, header, height):
         if height < cls.SAPLING_HEIGHT:
